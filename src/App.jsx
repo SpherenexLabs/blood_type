@@ -867,33 +867,63 @@ function describeMissing(result, missing) {
 /* ------------------------------------------------------------------ *
  * Camera selection — "auto available camera"
  * ------------------------------------------------------------------ */
-const EXTERNAL_HINT = /(usb|uvc|webcam|hd\s?cam|external|logi|logitech|c\d{3}|brio|cam\s?link|capture)/i
-const INTERNAL_HINT = /(integrated|built[\s-]?in|internal|facetime|front|rear|back|ir\b|infrared)/i
+const EXTERNAL_HINT = /(usb|uvc|external|logi|logitech|c\d{3}|brio|cam\s?link|capture|webcam)/i
+const INTERNAL_HINT = /(integrated|built[\s-]?in|internal|facetime|laptop|ir\b|infrared)/i
 const VIRTUAL_HINT = /(virtual|obs|snap|droidcam|manycam|xsplit|epoccam|iriun|splitcam)/i
 const FRONT_HINT = /(front|user|selfie|facetime)/i
-const BACK_HINT = /(back|rear|environment|world|wide)/i
+const BACK_HINT = /(back|rear|environment|world)/i
 
-/** A short tag for what kind of camera this is, for the picker. */
+/**
+ * A short tag for what kind of camera this is. Order matters: "Integrated
+ * Webcam" contains both "integrated" and "webcam", and it is a built-in camera,
+ * so the internal test has to win.
+ */
 function cameraKind(device) {
   const label = device.label || ''
+  if (!label) return ''
   if (VIRTUAL_HINT.test(label)) return 'virtual'
+  if (INTERNAL_HINT.test(label)) return 'built-in'
   if (BACK_HINT.test(label)) return 'back'
   if (FRONT_HINT.test(label)) return 'front'
   if (EXTERNAL_HINT.test(label)) return 'USB / external'
-  if (INTERNAL_HINT.test(label)) return 'built-in'
   return ''
 }
 
-/** Rank inputs so a real USB card camera wins over a laptop lid camera. */
+/* The camera the user last chose by hand, so a reload does not quietly hand
+   them a different one. */
+const CAMERA_STORAGE_KEY = 'blood-group-detector.camera'
+
+function rememberCamera(deviceId) {
+  try {
+    if (deviceId) localStorage.setItem(CAMERA_STORAGE_KEY, deviceId)
+    else localStorage.removeItem(CAMERA_STORAGE_KEY)
+  } catch {
+    // Private mode / blocked storage: the choice just will not outlive the tab.
+  }
+}
+
+function recallCamera() {
+  try {
+    return localStorage.getItem(CAMERA_STORAGE_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Rank inputs for the automatic pick only — a real USB card camera first, a
+ * phone's back camera next, a laptop lid camera after that. An explicit choice
+ * by the user always overrides this.
+ */
+const KIND_SCORE = { 'USB / external': 3, back: 2, '': 1, front: 0, 'built-in': 0, virtual: -2 }
+
 function cameraPreference(devices) {
   return devices
     .map((device, index) => {
-      const label = device.label || ''
-      let score = 1
-      if (VIRTUAL_HINT.test(label)) score = -2
-      else if (EXTERNAL_HINT.test(label)) score = 3
-      else if (INTERNAL_HINT.test(label)) score = 0
-      else if (!label) score = devices.length > 1 && index > 0 ? 2 : 1
+      const kind = cameraKind(device)
+      // With no labels at all we cannot tell them apart; index 1 is the USB slot
+      // on most machines, which is what the Python build defaulted to.
+      const score = !device.label && devices.length > 1 && index > 0 ? 2 : KIND_SCORE[kind] ?? 1
       return { device, score, index }
     })
     .sort((a, b) => b.score - a.score || a.index - b.index)
@@ -952,6 +982,8 @@ export default function App() {
 
   const [devices, setDevices] = useState([])
   const [activeDeviceId, setActiveDeviceId] = useState('')
+  // true once the live camera is the user's own pick rather than the auto scan
+  const [pinned, setPinned] = useState(false)
   const [track, setTrack] = useState(null)
   const [aspect, setAspect] = useState('16 / 9')
   const [fps, setFps] = useState(0)
@@ -1032,57 +1064,94 @@ export default function App() {
    * the browser equivalent, preferring an external camera the way
    * CAMERA_INDEX=1 used to.
    */
-  const autoSelect = useCallback(async () => {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      say('This browser cannot access cameras. Use Chrome or Edge over http://localhost or https.', 'error')
-      return
-    }
-    say('Looking for an available camera…')
-    try {
-      // A first generic open grants permission, which is what makes device
-      // labels (and therefore the external-camera preference) readable.
-      let inputs = await listCameras()
-      if (!inputs.some((device) => device.label)) {
-        await attach(undefined)
-        inputs = await listCameras()
-      }
-      const ordered = cameraPreference(inputs)
-      for (const device of ordered) {
-        try {
-          const videoTrack = await attach(device.deviceId)
-          if (!videoTrack) return
-          const settings = videoTrack.getSettings()
-          say(
-            `Auto-selected ${videoTrack.label || 'camera'} at ${settings.width}x${settings.height}` +
-              `${settings.frameRate ? ` @ ${Math.round(settings.frameRate)}fps` : ''}. Hold the test card in view.`,
-            'ok',
-          )
-          return
-        } catch {
-          // Busy or blocked camera — fall through to the next candidate.
-        }
-      }
-      if (!streamRef.current) throw new Error('No camera could be opened. Close any app already using it and retry.')
-      say('Camera ready. Hold the test card in view.', 'ok')
-    } catch (error) {
-      say(error.message || 'Camera access was blocked.', 'error')
-    }
-  }, [attach, listCameras, say])
+  const describeCamera = useCallback((videoTrack, prefix) => {
+    const settings = videoTrack.getSettings()
+    const size = settings.width ? ` at ${settings.width}x${settings.height}` : ''
+    const rate = settings.frameRate ? ` @ ${Math.round(settings.frameRate)}fps` : ''
+    say(`${prefix} ${videoTrack.label || 'camera'}${size}${rate}. Hold the test card in view.`, 'ok')
+  }, [say])
 
+  const autoSelect = useCallback(
+    async ({ useSaved = true } = {}) => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        say('This browser cannot access cameras. Use Chrome or Edge over http://localhost or https.', 'error')
+        return
+      }
+      say(useSaved ? 'Starting the camera…' : 'Looking for an available camera…')
+      try {
+        // A first generic open grants permission, which is what makes device
+        // labels (and therefore any preference at all) readable.
+        let inputs = await listCameras()
+        if (!inputs.some((device) => device.label)) {
+          await attach(undefined)
+          inputs = await listCameras()
+        }
+
+        // The user's own choice comes first and is never second-guessed.
+        const saved = useSaved ? recallCamera() : ''
+        let savedFailed = false
+        if (saved && inputs.some((device) => device.deviceId === saved)) {
+          try {
+            const videoTrack = await attach(saved)
+            if (!videoTrack) return
+            setPinned(true)
+            describeCamera(videoTrack, 'Using your chosen camera:')
+            return
+          } catch {
+            savedFailed = true // busy or blocked — say so once a fallback is up
+          }
+        }
+
+        for (const device of cameraPreference(inputs)) {
+          try {
+            const videoTrack = await attach(device.deviceId)
+            if (!videoTrack) return
+            setPinned(false)
+            describeCamera(
+              videoTrack,
+              savedFailed ? 'Your chosen camera would not open (in use?) — falling back to' : 'Auto-selected',
+            )
+            return
+          } catch {
+            // Busy or blocked camera — fall through to the next candidate.
+          }
+        }
+        if (!streamRef.current) throw new Error('No camera could be opened. Close any app already using it and retry.')
+        setPinned(false)
+        say('Camera ready. Hold the test card in view.', 'ok')
+      } catch (error) {
+        say(error.message || 'Camera access was blocked.', 'error')
+      }
+    },
+    [attach, describeCamera, listCameras, say],
+  )
+
+  /** An explicit pick by the user: it is opened, and it is remembered. */
   const selectCamera = useCallback(
     async (deviceId) => {
+      if (!deviceId) return
       setLive(false)
       say('Switching camera…')
       try {
         const videoTrack = await attach(deviceId)
-        if (videoTrack) say(`${videoTrack.label || 'Camera'} connected. Hold the test card in view.`, 'ok')
+        if (!videoTrack) return
+        rememberCamera(deviceId)
+        setPinned(true)
+        describeCamera(videoTrack, 'Now using')
       } catch (error) {
-        say(error.message || 'That camera could not be opened.', 'error')
-        await autoSelect()
+        say(`${error.message || 'That camera could not be opened.'} It may be in use by another app.`, 'error')
       }
     },
-    [attach, autoSelect, say],
+    [attach, describeCamera, say],
   )
+
+  /** Hand the choice back to the automatic scan. */
+  const useAutoCamera = useCallback(async () => {
+    rememberCamera('')
+    setPinned(false)
+    setLive(false)
+    await autoSelect({ useSaved: false })
+  }, [autoSelect])
 
   useEffect(() => {
     // Deferred by a tick so the first status update lands outside the effect body.
@@ -1103,14 +1172,24 @@ export default function App() {
       const inputs = await listCameras()
       const stillThere = inputs.some((device) => device.deviceId === activeDeviceId)
       const alive = streamRef.current?.getVideoTracks()[0]?.readyState === 'live'
-      if (!stillThere || !alive) {
+      const saved = recallCamera()
+
+      // The camera the user chose has come back (replugged) — return to it.
+      if (saved && saved !== activeDeviceId && inputs.some((device) => device.deviceId === saved)) {
         setLive(false)
-        await autoSelect()
+        await selectCamera(saved)
+        return
       }
+      if (stillThere && alive) return // nothing to do; never override a working choice
+      if (saved && saved === activeDeviceId) {
+        say('Your chosen camera was disconnected. Looking for another one…', 'error')
+      }
+      setLive(false)
+      await autoSelect()
     }
     media.addEventListener('devicechange', onChange)
     return () => media.removeEventListener('devicechange', onChange)
-  }, [activeDeviceId, autoSelect, listCameras])
+  }, [activeDeviceId, autoSelect, listCameras, selectCamera, say])
 
   // Real frame-rate meter: counts frames the camera actually presented.
   useEffect(() => {
@@ -1425,7 +1504,9 @@ export default function App() {
               <label htmlFor="camera-select">
                 Camera
                 <span className="count">
-                  {devices.length ? `${devices.length} found on this device` : 'scanning…'}
+                  {devices.length
+                    ? `${devices.length} found · ${pinned ? 'your choice, saved' : 'auto-selected'}`
+                    : 'scanning…'}
                 </span>
               </label>
               <select
@@ -1449,7 +1530,12 @@ export default function App() {
               <button type="button" className="secondary" onClick={cycleCamera} disabled={devices.length < 2}>
                 Switch<span className="wide-only"> camera</span>
               </button>
-              <button type="button" className="secondary" onClick={autoSelect}>
+              <button
+                type="button"
+                className={pinned ? 'secondary' : 'secondary active'}
+                onClick={useAutoCamera}
+                title="Forget the saved camera and pick automatically"
+              >
                 Auto<span className="wide-only">-select</span>
               </button>
               <button type="button" className="secondary" onClick={listCameras}>
@@ -1606,6 +1692,7 @@ select{flex:1 1 200px;width:100%;min-width:0;max-width:100%;padding:11px 12px;bo
   border-radius:10px;color:#f4f7fb;background:#16253a;font:inherit;text-overflow:ellipsis}
 .picker-actions{display:flex;gap:8px;flex-wrap:wrap;min-width:0}
 .picker-actions button{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.picker-actions button.active{box-shadow:inset 0 0 0 1px #36d1dc80;color:var(--cyan)}
 
 /* ---------- controls ---------- */
 .controls{padding:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}

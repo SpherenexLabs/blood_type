@@ -27,11 +27,16 @@ browser.
   camera is plugged in or removed.
 - **Picking a camera yourself.** The dropdown lists every camera the device
   reports, labelled with its kind (front / back / USB / built-in) and how many
-  were found; picking one switches the feed immediately. **Switch** hops to the
-  next camera in one tap (handy for front/back on a phone), **Auto** redoes the
-  scan, **Rescan** refreshes the list. Resolution and frame rate are requested as
-  preferences only, so a camera that cannot manage them is still opened rather
-  than skipped.
+  were found; picking one switches the feed immediately and **saves that
+  choice** — reloads, restarts and hot reloads keep using it, and the line under
+  "Camera" reads `your choice, saved` instead of `auto-selected`. Nothing
+  overrides a working choice: the auto-scan only runs when there is no saved
+  camera, and if the saved one is unplugged it says so before falling back (and
+  returns to it when you plug it back in). **Switch** hops to the next camera in
+  one tap (handy for front/back on a phone), **Auto** forgets the saved choice
+  and goes back to automatic, **Rescan** refreshes the list. Resolution and frame
+  rate are requested as preferences only, so a camera that cannot manage them is
+  still opened rather than skipped.
 - **Frame rate.** The preview is the raw `<video>` element requested at
   1280x720 / 60fps, so frames go camera → compositor without passing through
   JavaScript (the old MJPEG `/video_feed` re-encoded every frame). The badge
