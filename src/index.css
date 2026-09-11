@@ -1,0 +1,19 @@
+/* Base page shell only — every dashboard style lives inside src/App.jsx. */
+:root {
+  color-scheme: dark;
+  font: 15px/1.5 Inter, system-ui, 'Segoe UI', Roboto, sans-serif;
+  color: #f4f7fb;
+  background: #08111f;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100svh;
+  background: radial-gradient(circle at 15% 0, #19375a 0, transparent 30%), #08111f;
+}
+
+#root {
+  min-height: 100svh;
+}
