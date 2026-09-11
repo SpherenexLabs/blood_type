@@ -24,8 +24,14 @@ browser.
   built-in lid camera next, virtual cameras (OBS, DroidCam…) last. This mirrors
   the old `CAMERA_INDEX=1` default. Each candidate is opened and checked for real
   frames before it is accepted, and the list is rescanned automatically when a
-  camera is plugged in or removed. The dropdown overrides the choice manually;
-  **Auto-select** redoes the scan.
+  camera is plugged in or removed.
+- **Picking a camera yourself.** The dropdown lists every camera the device
+  reports, labelled with its kind (front / back / USB / built-in) and how many
+  were found; picking one switches the feed immediately. **Switch** hops to the
+  next camera in one tap (handy for front/back on a phone), **Auto** redoes the
+  scan, **Rescan** refreshes the list. Resolution and frame rate are requested as
+  preferences only, so a camera that cannot manage them is still opened rather
+  than skipped.
 - **Frame rate.** The preview is the raw `<video>` element requested at
   1280x720 / 60fps, so frames go camera → compositor without passing through
   JavaScript (the old MJPEG `/video_feed` re-encoded every frame). The badge

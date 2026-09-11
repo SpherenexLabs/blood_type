@@ -870,6 +870,19 @@ function describeMissing(result, missing) {
 const EXTERNAL_HINT = /(usb|uvc|webcam|hd\s?cam|external|logi|logitech|c\d{3}|brio|cam\s?link|capture)/i
 const INTERNAL_HINT = /(integrated|built[\s-]?in|internal|facetime|front|rear|back|ir\b|infrared)/i
 const VIRTUAL_HINT = /(virtual|obs|snap|droidcam|manycam|xsplit|epoccam|iriun|splitcam)/i
+const FRONT_HINT = /(front|user|selfie|facetime)/i
+const BACK_HINT = /(back|rear|environment|world|wide)/i
+
+/** A short tag for what kind of camera this is, for the picker. */
+function cameraKind(device) {
+  const label = device.label || ''
+  if (VIRTUAL_HINT.test(label)) return 'virtual'
+  if (BACK_HINT.test(label)) return 'back'
+  if (FRONT_HINT.test(label)) return 'front'
+  if (EXTERNAL_HINT.test(label)) return 'USB / external'
+  if (INTERNAL_HINT.test(label)) return 'built-in'
+  return ''
+}
 
 /** Rank inputs so a real USB card camera wins over a laptop lid camera. */
 function cameraPreference(devices) {
@@ -887,18 +900,34 @@ function cameraPreference(devices) {
     .map((entry) => entry.device)
 }
 
+/**
+ * Browsers only reveal real device labels once camera permission is granted, so
+ * fall back to a position-based name that still tells the two common cases
+ * apart.
+ */
 function cameraLabel(device, index) {
-  if (device.label) return device.label
-  return index === 0 ? 'Camera 1 (usually built-in)' : `Camera ${index + 1} (USB/external)`
+  const name = device.label || (index === 0 ? 'Camera 1 (usually built-in)' : `Camera ${index + 1} (USB/external)`)
+  const kind = cameraKind(device)
+  return kind && !new RegExp(kind.split(' ')[0], 'i').test(name) ? `${name} — ${kind}` : name
 }
 
+/**
+ * Wishes only — every field is `ideal`. A mandatory `min` frame rate makes
+ * getUserMedia throw OverconstrainedError on any camera that runs slower (many
+ * webcams drop to 15fps in dim light), which would hide that camera completely.
+ */
 function videoConstraints(deviceId) {
   return {
     deviceId: deviceId ? { exact: deviceId } : undefined,
     width: { ideal: CAPTURE_WIDTH },
     height: { ideal: CAPTURE_HEIGHT },
-    frameRate: { ideal: TARGET_FPS, min: 24 },
+    frameRate: { ideal: TARGET_FPS },
   }
+}
+
+/** Last resort: take the camera on any terms rather than not at all. */
+function relaxedConstraints(deviceId) {
+  return deviceId ? { deviceId: { exact: deviceId } } : true
 }
 
 /* ------------------------------------------------------------------ *
@@ -924,6 +953,7 @@ export default function App() {
   const [devices, setDevices] = useState([])
   const [activeDeviceId, setActiveDeviceId] = useState('')
   const [track, setTrack] = useState(null)
+  const [aspect, setAspect] = useState('16 / 9')
   const [fps, setFps] = useState(0)
   const [analysisMs, setAnalysisMs] = useState(0)
   const [status, setStatus] = useState({ kind: 'info', text: 'Looking for an available camera…' })
@@ -951,7 +981,14 @@ export default function App() {
   /** Open one specific camera and wait until it actually delivers frames. */
   const attach = useCallback(async (deviceId) => {
     const generation = (generationRef.current += 1)
-    const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(deviceId), audio: false })
+    let stream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(deviceId), audio: false })
+    } catch (error) {
+      // A resolution or frame-rate wish is never worth losing the camera over.
+      if (error.name !== 'OverconstrainedError' && error.name !== 'NotReadableError') throw error
+      stream = await navigator.mediaDevices.getUserMedia({ video: relaxedConstraints(deviceId), audio: false })
+    }
     if (generation !== generationRef.current) {
       stream.getTracks().forEach((item) => item.stop())
       return null
@@ -975,12 +1012,18 @@ export default function App() {
         resolve()
       }
       video.addEventListener('loadeddata', done)
-      setTimeout(done, 2500)
+      setTimeout(done, 4000) // phone cameras can take a beat to hand over the first frame
     })
     if (!video.videoWidth) throw new Error('The camera opened but produced no frames.')
     const videoTrack = stream.getVideoTracks()[0]
-    setTrack({ label: videoTrack.label, settings: videoTrack.getSettings() })
-    setActiveDeviceId(videoTrack.getSettings().deviceId || deviceId || '')
+    const settings = videoTrack.getSettings()
+    setTrack({ label: videoTrack.label, settings })
+    // Not every browser reports deviceId back in getSettings(), so keep the id we
+    // asked for — the picker needs it to show which camera is live.
+    setActiveDeviceId(settings.deviceId || deviceId || '')
+    // Show the frame exactly as it is analysed: the panel takes the camera's own
+    // aspect ratio instead of cropping a 4:3 sensor into a 16:9 box.
+    setAspect(`${video.videoWidth} / ${video.videoHeight}`)
     return videoTrack
   }, [])
 
@@ -1301,6 +1344,21 @@ export default function App() {
     }
   }, [live, grabFrame, locateRegions, overlayFrom, say])
 
+  /** One-tap hop to the next camera on the device — the mobile-friendly path. */
+  const cycleCamera = useCallback(async () => {
+    if (devices.length < 2) {
+      const inputs = await listCameras()
+      if (inputs.length < 2) {
+        say('This device only reports one camera.')
+        return
+      }
+    }
+    const list = devices.length ? devices : await listCameras()
+    const current = list.findIndex((device) => device.deviceId === activeDeviceId)
+    const next = list[(current + 1) % list.length]
+    if (next) await selectCamera(next.deviceId)
+  }, [devices, activeDeviceId, listCameras, selectCamera, say])
+
   const toggleLive = useCallback(() => {
     const next = !liveRef.current.on
     setLive(next)
@@ -1337,40 +1395,67 @@ export default function App() {
 
       <section className="grid">
         <div className="card">
-          <div className="camera">
-            <video ref={videoRef} playsInline muted autoPlay />
+          <div className="camera" style={{ aspectRatio: aspect }}>
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              autoPlay
+              onLoadedMetadata={(event) => {
+                const { videoWidth, videoHeight } = event.currentTarget
+                if (videoWidth) setAspect(`${videoWidth} / ${videoHeight}`)
+              }}
+            />
             <canvas ref={overlayRef} className="overlay" />
-            <div className="badge live">LIVE CAMERA</div>
+            <div className="badge live">LIVE</div>
             <div className="badge stats">
               <strong>{fps}</strong> fps · {resolution}
-              {analysisMs ? <> · analysis {analysisMs} ms</> : null}
+              {analysisMs ? <span className="wide-only"> · analysis {analysisMs} ms</span> : null}
             </div>
+            {track?.label ? <div className="badge name">{track.label}</div> : null}
+            {track ? null : (
+              <div className="camera-empty">
+                {status.kind === 'error' ? status.text : 'Waiting for a camera…'}
+              </div>
+            )}
           </div>
 
           <div className="camera-picker">
-            <label htmlFor="camera-select">Camera</label>
-            <select
-              id="camera-select"
-              value={activeDeviceId}
-              disabled={!devices.length}
-              onChange={(event) => selectCamera(event.target.value)}
-            >
-              {devices.length ? (
-                devices.map((device, index) => (
-                  <option key={device.deviceId || index} value={device.deviceId}>
-                    {cameraLabel(device, index)}
-                  </option>
-                ))
-              ) : (
-                <option value="">No camera found</option>
-              )}
-            </select>
-            <button type="button" className="secondary" onClick={autoSelect}>
-              Auto-select
-            </button>
-            <button type="button" className="secondary" onClick={listCameras}>
-              Refresh
-            </button>
+            <div className="picker-row">
+              <label htmlFor="camera-select">
+                Camera
+                <span className="count">
+                  {devices.length ? `${devices.length} found on this device` : 'scanning…'}
+                </span>
+              </label>
+              <select
+                id="camera-select"
+                value={activeDeviceId}
+                disabled={!devices.length}
+                onChange={(event) => selectCamera(event.target.value)}
+              >
+                {devices.length ? (
+                  devices.map((device, index) => (
+                    <option key={device.deviceId || index} value={device.deviceId}>
+                      {cameraLabel(device, index)}
+                    </option>
+                  ))
+                ) : (
+                  <option value="">No camera found</option>
+                )}
+              </select>
+            </div>
+            <div className="picker-actions">
+              <button type="button" className="secondary" onClick={cycleCamera} disabled={devices.length < 2}>
+                Switch<span className="wide-only"> camera</span>
+              </button>
+              <button type="button" className="secondary" onClick={autoSelect}>
+                Auto<span className="wide-only">-select</span>
+              </button>
+              <button type="button" className="secondary" onClick={listCameras}>
+                Rescan
+              </button>
+            </div>
           </div>
 
           <div className="controls">
@@ -1466,68 +1551,133 @@ export default function App() {
 
 const STYLES = `
 .shell{--bg:#08111f;--panel:#101c2d;--line:#26364d;--cyan:#36d1dc;--blue:#5b86e5;--muted:#91a2b9;
-  width:min(1180px,calc(100% - 32px));margin:0 auto;padding:34px 0 60px;color:#f4f7fb;
-  font:15px/1.5 Inter,system-ui,sans-serif;letter-spacing:0;text-align:left}
-.shell *{box-sizing:border-box}
-body{margin:0;background:radial-gradient(circle at 15% 0,#19375a 0,transparent 30%),#08111f;color-scheme:dark}
+  width:100%;max-width:1180px;margin:0 auto;color:#f4f7fb;font:15px/1.5 Inter,system-ui,sans-serif;letter-spacing:0;
+  text-align:left;
+  padding-block:clamp(16px,4vw,34px) clamp(32px,9vw,60px);
+  padding-left:max(14px,env(safe-area-inset-left));
+  padding-right:max(14px,env(safe-area-inset-right))}
+.shell,.shell *{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at 15% 0,#19375a 0,transparent 30%),#08111f;color-scheme:dark;
+  overflow-x:hidden}
 #root{width:100%;max-width:none;margin:0;border:0;text-align:left;min-height:100svh;display:block}
-.shell header{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin-bottom:24px}
-.shell h1{margin:0;font-size:clamp(26px,4vw,42px);letter-spacing:-1.5px;font-weight:700;color:#f4f7fb}
-.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:2px;font-weight:800;font-size:12px}
+
+/* ---------- header ---------- */
+.shell header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;
+  margin-bottom:clamp(16px,3vw,24px)}
+.shell h1{margin:0;font-size:clamp(23px,6vw,42px);letter-spacing:-1.2px;font-weight:700;color:#f4f7fb;
+  line-height:1.1}
+.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:2px;font-weight:800;
+  font-size:clamp(10px,2.4vw,12px)}
 .meta,.score{color:var(--muted);font-size:12px}
-.meta{text-align:right;display:grid;gap:4px}
+.meta{text-align:right;display:grid;gap:4px;flex:0 0 auto;word-break:break-word}
 .ok-text{color:#43d69d}
-.grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(300px,.8fr);gap:22px;align-items:start}
-.card{background:#101c2de8;border:1px solid var(--line);border-radius:20px;box-shadow:0 18px 55px #0005;overflow:hidden}
-.camera{position:relative;aspect-ratio:16/9;background:#030711}
-.camera video,.camera .overlay{position:absolute;inset:0;width:100%;height:100%;display:block;object-fit:cover}
+
+/* ---------- layout ---------- */
+.grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.8fr);gap:22px;align-items:start}
+.card{background:#101c2de8;border:1px solid var(--line);border-radius:clamp(14px,3vw,20px);
+  box-shadow:0 18px 55px #0005;overflow:hidden;min-width:0}
+
+/* ---------- camera ---------- */
+.camera{position:relative;aspect-ratio:16/9;max-height:min(70svh,620px);background:#030711}
+.camera video,.camera .overlay{position:absolute;inset:0;width:100%;height:100%;display:block;
+  /* contain, not cover: the preview must show exactly the frame that is analysed */
+  object-fit:contain}
 .camera .overlay{pointer-events:none}
-.badge{position:absolute;top:16px;padding:7px 11px;border-radius:30px;background:#09111dcc;
-  font-size:12px;font-weight:800;backdrop-filter:blur(6px)}
-.badge.live{left:16px}
-.badge.stats{right:16px;font-weight:600;color:var(--muted)}
+.camera-empty{position:absolute;inset:0;display:grid;place-items:center;padding:24px;text-align:center;
+  color:var(--muted);font-size:13px}
+.badge{position:absolute;padding:6px 10px;border-radius:30px;background:#09111dd9;font-size:11px;font-weight:800;
+  backdrop-filter:blur(6px);max-width:calc(100% - 24px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge.live{top:12px;left:12px}
+.badge.stats{top:12px;right:12px;font-weight:600;color:var(--muted)}
 .badge.stats strong{color:#f4f7fb}
+.badge.name{bottom:12px;left:12px;font-weight:600;color:var(--muted);max-width:calc(100% - 24px)}
 .badge.live:before{content:"";display:inline-block;width:8px;height:8px;background:#ff4d67;border-radius:50%;
-  margin-right:7px;box-shadow:0 0 10px #ff4d67}
-.camera-picker{padding:16px 18px 0;display:flex;align-items:center;gap:10px;color:var(--muted);flex-wrap:wrap}
-select{min-width:190px;max-width:100%;flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
-  color:#f4f7fb;background:#16253a;font:inherit}
-.controls{padding:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  margin-right:6px;box-shadow:0 0 10px #ff4d67}
+
+/* ---------- camera picker ---------- */
+/* minmax(0,1fr) throughout: a long camera label ("camera2 0, facing back", a
+   USB device name) would otherwise set the min-content width of these tracks
+   and push the buttons outside the card, where overflow:hidden eats them. */
+.camera-picker{padding:16px 16px 0;display:grid;grid-template-columns:minmax(0,1fr);gap:10px}
+.picker-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
+.picker-row label{color:var(--muted);font-size:12px;font-weight:700;display:grid;gap:2px;flex:0 0 auto}
+.picker-row .count{font-weight:500;font-size:11px;color:#6e819a}
+select{flex:1 1 200px;width:100%;min-width:0;max-width:100%;padding:11px 12px;border:1px solid var(--line);
+  border-radius:10px;color:#f4f7fb;background:#16253a;font:inherit;text-overflow:ellipsis}
+.picker-actions{display:flex;gap:8px;flex-wrap:wrap;min-width:0}
+.picker-actions button{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---------- controls ---------- */
+.controls{padding:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0}
 button{border:0;border-radius:12px;padding:13px 20px;color:#fff;font:inherit;font-weight:800;cursor:pointer;
-  background:linear-gradient(135deg,var(--cyan),var(--blue));box-shadow:0 8px 24px #467ed44d}
-button.secondary{padding:10px 13px;background:#1a2b42;box-shadow:none;font-weight:700}
+  min-height:44px;background:linear-gradient(135deg,var(--cyan),var(--blue));box-shadow:0 8px 24px #467ed44d}
+button.secondary{padding:10px 13px;background:#1a2b42;box-shadow:none;font-weight:700;font-size:13px}
 button.toggle{background:#1a2b42;box-shadow:none}
 button.toggle.on{background:linear-gradient(135deg,#ff416c,#c9184a);box-shadow:0 8px 24px #d11d554d}
-button:disabled{opacity:.55;cursor:wait}
-.message{color:var(--muted);flex:1;min-width:200px}
+button:disabled{opacity:.45;cursor:not-allowed}
+.message{color:var(--muted);flex:1 1 100%;min-width:0;font-size:13px;overflow-wrap:anywhere}
 .error{color:#ff8293}
-.result{padding:26px}
-.blood{display:grid;place-items:center;width:130px;height:130px;margin:20px auto 28px;
-  border-radius:50% 50% 50% 12%;transform:rotate(45deg);background:linear-gradient(135deg,#ff416c,#c9184a);
-  box-shadow:0 15px 45px #d11d554d}
-.blood span{transform:rotate(-45deg);font-size:40px;font-weight:900}
-.placeholder{color:var(--muted);text-align:center;padding:60px 10px;display:grid;gap:12px}
+
+/* ---------- result ---------- */
+.result{padding:clamp(18px,4vw,26px)}
+.blood{display:grid;place-items:center;width:clamp(104px,26vw,130px);height:clamp(104px,26vw,130px);
+  margin:18px auto 24px;border-radius:50% 50% 50% 12%;transform:rotate(45deg);
+  background:linear-gradient(135deg,#ff416c,#c9184a);box-shadow:0 15px 45px #d11d554d}
+.blood span{transform:rotate(-45deg);font-size:clamp(32px,8vw,40px);font-weight:900}
+.placeholder{color:var(--muted);text-align:center;padding:clamp(32px,9vw,60px) 4px;display:grid;gap:12px}
 .placeholder p{margin:0}
-.region{display:grid;grid-template-columns:54px 1fr auto;gap:12px;align-items:center;padding:13px 0;
+.region{display:grid;grid-template-columns:48px minmax(0,1fr) auto;gap:10px;align-items:center;padding:12px 0;
   border-top:1px solid var(--line)}
-.antigen{width:44px;height:44px;display:grid;place-items:center;border-radius:12px;background:#1a2b42;font-weight:900}
+.antigen{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:#1a2b42;
+  font-weight:900}
 .status{font-weight:800}
+.score.right{text-align:right;white-space:nowrap}
+.score.hint{margin-top:18px}
 .positive{color:#43d69d}
 .negative{color:#ffb454}
-.score.right{text-align:right}
-.score.hint{margin-top:18px}
-.result-image{width:100%;margin-top:20px;border-radius:12px;border:1px solid var(--line);display:block}
-.thumbs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
-.thumbs figure{margin:0;display:grid;gap:6px}
+.result-image{width:100%;margin-top:18px;border-radius:12px;border:1px solid var(--line);display:block}
+.thumbs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}
+.thumbs figure{margin:0;display:grid;gap:6px;min-width:0}
 .thumbs img{width:100%;border-radius:8px;border:1px solid var(--line);display:block}
 .thumbs figcaption{color:var(--muted);font-size:11px;text-align:center;font-weight:700}
-.download{display:block;margin-top:16px;text-align:center;padding:11px;border-radius:12px;background:#1a2b42;
+.download{display:block;margin-top:16px;text-align:center;padding:13px;border-radius:12px;background:#1a2b42;
   color:#f4f7fb;text-decoration:none;font-weight:700;font-size:13px}
-@media(max-width:860px){
-  .shell header{flex-direction:column;align-items:flex-start}
-  .meta{text-align:left}
-  .grid{grid-template-columns:1fr}
-  .controls{align-items:stretch;flex-direction:column}
-  button{width:100%}
+
+/* ---------- tablet ---------- */
+@media(max-width:900px){
+  .grid{grid-template-columns:minmax(0,1fr)}
+  .shell header{flex-direction:column;align-items:flex-start;gap:8px}
+  .meta{text-align:left;grid-auto-flow:column;gap:14px}
+  .camera{max-height:none}
+}
+
+/* ---------- phone ---------- */
+@media(max-width:620px){
+  .meta{grid-auto-flow:row;gap:2px}
+  /* 16px keeps iOS Safari from zooming the page when the picker is focused */
+  select{font-size:16px;flex-basis:100%}
+  .picker-row label{flex:1 1 100%}
+  .picker-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
+  .picker-actions button{font-size:12px;padding:10px 6px}
+  .controls{padding:14px;gap:8px}
+  .controls button{width:100%}
+  .wide-only{display:none}
+  .badge{font-size:10px;padding:5px 9px}
+  .region{grid-template-columns:42px minmax(0,1fr);row-gap:4px}
+  .region .score.right{grid-column:2;text-align:left}
+  .antigen{width:38px;height:38px;border-radius:10px}
+  .thumbs{grid-template-columns:1fr;gap:14px}
+  .thumbs figure{grid-template-columns:1fr 1fr;gap:8px}
+  .thumbs figcaption{grid-column:1/-1;text-align:left}
+}
+
+/* ---------- short landscape phones: keep the controls reachable ---------- */
+@media(max-height:520px) and (orientation:landscape){
+  .camera{max-height:62svh}
+  .shell{padding-block:12px 24px}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .badge.live:before{box-shadow:none}
 }
 `
